@@ -1,36 +1,44 @@
 #!/usr/bin/env python3
-"""Sort images from an inbox folder into Photos/YYYY folders by capture date.
+"""Sort photos and videos from a source folder into Nostalgia/YYYY by date.
 
-For each image found recursively under the inbox folder, the capture year is
-determined from EXIF (DateTimeOriginal, then DateTimeDigitized, then DateTime),
-falling back to the file's modification time when no usable EXIF date exists.
-Each image is copied into ``<dest>/YYYY/`` and is never overwritten: if a file
+For each photo or video found recursively under the source folder, the capture
+year is determined from embedded metadata, falling back to the file's
+modification time when none is available:
+
+  * Photos — EXIF DateTimeOriginal, then DateTimeDigitized, then DateTime.
+  * Videos — container metadata via ffprobe (Apple QuickTime creationdate,
+             then the standard creation_time), with a built-in MP4/MOV atom
+             reader as a fallback when ffprobe is not installed.
+
+Each file is copied into ``<dest>/YYYY/`` and is never overwritten: if a file
 with the same name already exists, an identical file (same SHA-256) is skipped,
 otherwise a numeric suffix is appended (e.g. ``photo_1.jpg``).
 
-By default images are copied (originals stay in the inbox); pass --move to
+By default files are copied (originals stay in the source); pass --move to
 move them instead.
 
 --source is required so the script works against any folder: a phone's DCIM,
 an SD or DSLR memory card, an external drive, or an existing folder on disk.
 
 Usage:
-    python3 sort_photos.py --source /media/sdcard/DCIM         # copy -> Photos
-    python3 sort_photos.py --source ~/Pictures/Inbox --move    # move instead
-    python3 sort_photos.py --source /mnt/usb --dest ~/Photos   # custom dest
-    python3 sort_photos.py --source /media/sdcard --dry-run    # preview only
+    python3 sort_photos.py --source /media/sdcard/DCIM          # copy -> Nostalgia
+    python3 sort_photos.py --source ~/Pictures/Inbox --move     # move instead
+    python3 sort_photos.py --source /mnt/usb --dest ~/Nostalgia # custom dest
+    python3 sort_photos.py --source /media/sdcard --dry-run     # preview only
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from collections import Counter, deque
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -45,7 +53,7 @@ BANNER = r"""
 ╚════██║██║   ██║██╔══██╗   ██║
 ███████║╚██████╔╝██║  ██║   ██║
 ╚══════╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝
-        photo sorter
+     photo & video sorter
 """
 
 # Status glyphs keyed by event kind: (symbol, ansi color).
@@ -119,7 +127,8 @@ def boot_sequence() -> None:
 
     for msg in ("Initializing filesystem...",
                 "Loading EXIF parser...",
-                "Connecting to image database..."):
+                "Probing video containers...",
+                "Connecting to media database..."):
         print(paint(msg, "32"))
         if pause:
             time.sleep(pause)
@@ -149,6 +158,20 @@ IMAGE_EXTENSIONS = {
     ".rw2", ".raf", ".sr2",
 }
 
+# File extensions treated as videos.
+VIDEO_EXTENSIONS = {
+    ".mp4", ".m4v", ".mov", ".qt", ".avi", ".mkv", ".webm", ".wmv",
+    ".flv", ".f4v", ".3gp", ".3g2", ".mpg", ".mpeg", ".m2v", ".mts",
+    ".m2ts", ".ts", ".vob", ".ogv", ".mxf", ".asf", ".divx",
+}
+
+# Everything we are willing to scan and sort.
+MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+
+# ffprobe (part of ffmpeg) reads creation dates from any container it supports;
+# resolved once at import. None when ffmpeg isn't installed -> atom/mtime path.
+_FFPROBE = shutil.which("ffprobe")
+
 # EXIF tag ids for date fields, in order of preference.
 _TAG_BY_NAME = {name: tag for tag, name in ExifTags.TAGS.items()}
 EXIF_DATE_TAGS = [
@@ -158,8 +181,8 @@ EXIF_DATE_TAGS = [
 ]
 
 
-def get_capture_date(path: Path) -> tuple[datetime, str]:
-    """Return (capture datetime, source) where source is 'exif' or 'mtime'."""
+def get_exif_date(path: Path) -> datetime | None:
+    """Return the capture datetime from image EXIF, or None if unavailable."""
     try:
         with Image.open(path) as img:
             exif = img.getexif()
@@ -169,12 +192,168 @@ def get_capture_date(path: Path) -> tuple[datetime, str]:
                 continue
             # EXIF dates look like "2021:05:14 15:53:59".
             try:
-                return datetime.strptime(str(raw).strip(), "%Y:%m:%d %H:%M:%S"), "exif"
+                return datetime.strptime(str(raw).strip(), "%Y:%m:%d %H:%M:%S")
             except ValueError:
                 continue
     except Exception:
-        # Unreadable / corrupt / not really an image -> fall back to mtime.
+        # Unreadable / corrupt / not really an image -> caller falls back.
         pass
+    return None
+
+
+def _parse_iso_datetime(raw: str) -> datetime | None:
+    """Parse an ISO-8601 timestamp out of container metadata.
+
+    Tolerates a trailing ``Z``, fractional seconds, and numeric UTC offsets
+    (with or without a colon). Returns None for unparseable values or the
+    QuickTime "unset" sentinel (anything at/below the 1904 epoch)."""
+    raw = raw.strip()
+    dt = None
+    try:
+        dt = datetime.fromisoformat(raw)  # Py3.11+ handles 'Z' and ±HHMM
+    except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z",
+                    "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+    if dt is None or dt.year <= 1904:
+        return None
+    return dt
+
+
+def _ffprobe_tag_dicts(path: Path) -> list[dict]:
+    """Return every tag dictionary (format + per-stream) ffprobe reports.
+
+    Empty when ffprobe is unavailable, errors, or the file has no tags."""
+    if _FFPROBE is None:
+        return []
+    try:
+        proc = subprocess.run(
+            [_FFPROBE, "-v", "quiet", "-print_format", "json",
+             "-show_format", "-show_streams", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0 or not proc.stdout:
+        return []
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        return []
+    dicts = []
+    fmt_tags = data.get("format", {}).get("tags")
+    if isinstance(fmt_tags, dict):
+        dicts.append(fmt_tags)
+    for stream in data.get("streams", []):
+        tags = stream.get("tags")
+        if isinstance(tags, dict):
+            dicts.append(tags)
+    return dicts
+
+
+def _iter_boxes(f, end: int):
+    """Yield (type, body_start, body_end) for ISO-BMFF boxes up to ``end``."""
+    while True:
+        pos = f.tell()
+        if pos + 8 > end:
+            return
+        header = f.read(8)
+        if len(header) < 8:
+            return
+        size = int.from_bytes(header[:4], "big")
+        box_type = header[4:8]
+        if size == 1:                       # 64-bit "largesize" follows the type
+            ext = f.read(8)
+            if len(ext) < 8:
+                return
+            size = int.from_bytes(ext, "big")
+            header_len = 16
+        elif size == 0:                     # box runs to the end of the file
+            yield box_type, f.tell(), end
+            return
+        else:
+            header_len = 8
+        body_end = pos + size
+        if size < header_len or body_end > end:
+            return
+        yield box_type, pos + header_len, body_end
+        f.seek(body_end)
+
+
+def _mvhd_creation_date(path: Path) -> datetime | None:
+    """Dependency-free fallback: read the creation time from an MP4/MOV ``mvhd``
+    atom (the QuickTime / ISO base-media format used by phones and cameras).
+
+    Used when ffprobe is unavailable or yields nothing. Returns local time, or
+    None. Only covers the ISO-BMFF family (mp4, m4v, mov, 3gp); other containers
+    fall back to mtime."""
+    qt_epoch = datetime(1904, 1, 1, tzinfo=timezone.utc)
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            moov = next((b for b in _iter_boxes(f, size) if b[0] == b"moov"), None)
+            if moov is None:
+                return None
+            f.seek(moov[1])
+            mvhd = next((b for b in _iter_boxes(f, moov[2]) if b[0] == b"mvhd"), None)
+            if mvhd is None:
+                return None
+            f.seek(mvhd[1])
+            version = f.read(1)
+            f.read(3)  # flags
+            field = f.read(8 if version == b"\x01" else 4)
+            seconds = int.from_bytes(field, "big")
+            if seconds == 0:
+                return None
+            return (qt_epoch + timedelta(seconds=seconds)).astimezone().replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def get_video_date(path: Path) -> datetime | None:
+    """Return the original creation datetime for a video, or None.
+
+    Prefers ffprobe metadata: Apple's capture-local ``creationdate`` first
+    (kept as written, since it already reflects where it was shot), then the
+    standard UTC ``creation_time`` (converted to local time). Falls back to a
+    built-in MP4/MOV atom reader when ffprobe is unavailable or finds nothing."""
+    tag_dicts = _ffprobe_tag_dicts(path)
+    # Apple stores the capture-local wall clock -> use its components as-is.
+    for tags in tag_dicts:
+        raw = tags.get("com.apple.quicktime.creationdate")
+        if raw:
+            dt = _parse_iso_datetime(raw)
+            if dt:
+                return dt.replace(tzinfo=None)
+    # creation_time is UTC -> convert to local so the bucketed year is local.
+    for tags in tag_dicts:
+        raw = tags.get("creation_time")
+        if raw:
+            dt = _parse_iso_datetime(raw)
+            if dt:
+                return dt.astimezone().replace(tzinfo=None) if dt.tzinfo else dt
+    return _mvhd_creation_date(path)
+
+
+def get_capture_date(path: Path) -> tuple[datetime, str]:
+    """Return (capture datetime, source) where source is 'exif', 'video' or 'mtime'.
+
+    Photos use EXIF; videos use container metadata (ffprobe, then a built-in
+    MP4/MOV atom reader). Both fall back to the file's modification time when no
+    embedded date is found."""
+    if path.suffix.lower() in VIDEO_EXTENSIONS:
+        captured = get_video_date(path)
+        if captured is not None:
+            return captured, "video"
+    else:
+        captured = get_exif_date(path)
+        if captured is not None:
+            return captured, "exif"
     return datetime.fromtimestamp(path.stat().st_mtime), "mtime"
 
 
@@ -207,9 +386,9 @@ def unique_destination(src: Path, dest_dir: Path) -> tuple[Path | None, bool]:
     return target, False
 
 
-def iter_images(source: Path):
+def iter_media(source: Path):
     for path in sorted(source.rglob("*")):
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+        if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS:
             yield path
 
 
@@ -336,8 +515,8 @@ def main() -> int:
     parser.add_argument("--source", required=True,
                         help="Folder to scan recursively (e.g. a phone DCIM, "
                              "SD/DSLR card mount, external drive, or any folder)")
-    parser.add_argument("--dest", default="Photos",
-                        help="Destination root for YYYY folders (default: Photos)")
+    parser.add_argument("--dest", default="Nostalgia",
+                        help="Destination root for YYYY folders (default: Nostalgia)")
     parser.add_argument("--move", action="store_true",
                         help="Move files instead of copying (removes them from source)")
     parser.add_argument("--dry-run", action="store_true",
@@ -356,75 +535,82 @@ def main() -> int:
         sys.exit(f"Source folder not found: {source}")
 
     scanned = moved = skipped_dup = errors = 0
-    exif_count = mtime_count = 0
+    exif_count = video_count = mtime_count = 0
     per_year: Counter[str] = Counter()
 
     # Collect up front so we know the total and can show a percentage.
     op_start = time.monotonic()
     print(f"{status('INFO')} Scanning {source}", flush=True)
-    images = list(iter_images(source))
-    total = len(images)
-    print(f"{status('OK')} {total} image{'s' if total != 1 else ''} detected")
+    media = list(iter_media(source))
+    total = len(media)
+    n_img = sum(1 for p in media if p.suffix.lower() in IMAGE_EXTENSIONS)
+    n_vid = total - n_img
+    print(f"{status('OK')} {total} media file{'s' if total != 1 else ''} detected "
+          f"({n_img} photo{'s' if n_img != 1 else ''}, "
+          f"{n_vid} video{'s' if n_vid != 1 else ''})")
     if total == 0:
         return 0
 
     # Live dashboard by default on a TTY; fall back to per-line output when
     # --verbose is set or stderr is not a terminal (e.g. piped to a file).
     live = not args.verbose and sys.stderr.isatty()
-    dash = Dashboard("Photo Organizer", source, total) if live else None
+    dash = Dashboard("Media Organizer", source, total) if live else None
     if not live:
         print(f"{status('PROC')} Processing {total} file{'s' if total != 1 else ''}...")
 
-    for img in images:
+    src_colors = {"exif": "35", "video": "36", "mtime": "90"}
+    for item in media:
         scanned += 1
         try:
-            captured, source_kind = get_capture_date(img)
+            captured, source_kind = get_capture_date(item)
             year = str(captured.year)
             dest_dir = dest_root / year
 
             if not args.dry_run:
                 dest_dir.mkdir(parents=True, exist_ok=True)
 
-            target, is_dup = unique_destination(img, dest_dir)
+            target, is_dup = unique_destination(item, dest_dir)
 
             if is_dup:
                 skipped_dup += 1
                 if live:
-                    dash.log(f"⚠ {img.name}  (duplicate)", "33")
+                    dash.log(f"⚠ {item.name}  (duplicate)", "33")
                 elif args.verbose:
-                    print(f"{status('SKIP')} Duplicate: {img.name}  (already in {year}/)")
+                    print(f"{status('SKIP')} Duplicate: {item.name}  (already in {year}/)")
                 continue
 
-            renamed = target.name != img.name
+            renamed = target.name != item.name
             if args.verbose:
                 action = "MOVE" if args.move else "COPY"
                 verb = "Moved" if args.move else "Copied"
-                src = paint("exif", "35") if source_kind == "exif" else paint("mtime", "90")
+                src = paint(source_kind, src_colors.get(source_kind, "90"))
                 prefix = "[dry-run] " if args.dry_run else ""
                 renamed_note = "  [renamed]" if renamed else ""
-                print(f"{prefix}{status(action)} {verb} {img.name}  → {dest_dir}/  ({src}){renamed_note}")
+                print(f"{prefix}{status(action)} {verb} {item.name}  → {dest_dir}/  ({src}){renamed_note}")
 
             if not args.dry_run:
                 if args.move:
-                    shutil.move(str(img), str(target))
+                    shutil.move(str(item), str(target))
                 else:
-                    shutil.copy2(str(img), str(target))
+                    shutil.copy2(str(item), str(target))
 
             moved += 1
             per_year[year] += 1
             if source_kind == "exif":
                 exif_count += 1
+            elif source_kind == "video":
+                video_count += 1
             else:
                 mtime_count += 1
             if live:
                 glyph, code = ("➜", "34") if args.move else ("✔", "32")
-                dash.log(f"{glyph} {img.name}  → {year}", code)
+                dash.log(f"{glyph} {item.name}  → {year}", code)
         except Exception as exc:
             errors += 1
             if live:
-                dash.log(f"✖ {img.name}: {exc}", "31")
+                dash.log(f"✖ {item.name}: {exc}", "31")
             else:
-                print(f"{status('ERROR', err=True)} Error processing {img.name}: {exc}",
+                print(f"{status('ERROR', err=True)} Error processing {item.name}: {exc}",
                       file=sys.stderr)
         finally:
             if live:
@@ -440,7 +626,8 @@ def main() -> int:
         ("Successfully moved" if args.move else "Successfully copied", str(moved)),
         ("Duplicates ignored", str(skipped_dup)),
         ("Errors", str(errors)),
-        ("EXIF timestamps", str(exif_count)),
+        ("Photo EXIF dates", str(exif_count)),
+        ("Video metadata dates", str(video_count)),
         ("Filesystem fallback", str(mtime_count)),
     ]
     box = render_box(title, rows)
