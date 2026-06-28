@@ -10,9 +10,11 @@ modification time when none is available:
              then the standard creation_time), with a built-in MP4/MOV atom
              reader as a fallback when ffprobe is not installed.
 
-Each file is copied into ``<dest>/YYYY/`` and is never overwritten: if a file
-with the same name already exists, an identical file (same SHA-256) is skipped,
-otherwise a numeric suffix is appended (e.g. ``photo_1.jpg``).
+Exact duplicates are detected by content (SHA-256) across the entire
+destination: a file whose bytes already exist anywhere under ``<dest>`` is
+skipped, no matter its name or which year folder holds the original. Each file
+is copied into ``<dest>/YYYY/`` and is never overwritten; a remaining name
+collision (same name, different content) gets a numeric suffix (``photo_1.jpg``).
 
 By default files are copied (originals stay in the source); pass --move to
 move them instead.
@@ -365,25 +367,78 @@ def sha256(path: Path, chunk_size: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-def unique_destination(src: Path, dest_dir: Path) -> tuple[Path | None, bool]:
-    """Pick a non-clobbering destination path for ``src`` inside ``dest_dir``.
+class DedupIndex:
+    """Exact-content index of every media file under the destination, so identical
+    bytes are never copied twice — regardless of filename or which year folder
+    holds the original.
 
-    Returns (target, is_duplicate). target is None and is_duplicate is True when
-    an identical file (same content) already exists -> caller should skip.
+    Detection is by SHA-256. To avoid hashing an entire existing library on every
+    run, files are bucketed by byte size first and a hash is computed only when
+    two files share a size (files of different sizes can't be byte-identical).
+    Each file's hash is memoized, so it is read at most once.
+    """
+
+    def __init__(self) -> None:
+        # size -> list of [path, hash_or_None]; the hash is filled in lazily the
+        # first time that file must be compared against another of the same size.
+        self._by_size: dict[int, list[list]] = {}
+
+    def _hash(self, entry: list) -> str:
+        if entry[1] is None:
+            entry[1] = sha256(entry[0])
+        return entry[1]
+
+    def add_existing(self, path: Path) -> None:
+        """Index a file already present on disk under the destination."""
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        self._by_size.setdefault(size, []).append([path, None])
+
+    def find_duplicate(self, src: Path, size: int) -> tuple[Path | None, str | None]:
+        """Look for a byte-identical file already indexed.
+
+        Returns (match, src_hash): ``match`` is the existing path when ``src`` is
+        a duplicate, else None. ``src_hash`` is src's SHA-256 when it had to be
+        computed (some indexed file shares its size), else None — pass it back to
+        ``register`` to avoid re-hashing.
+        """
+        bucket = self._by_size.get(size)
+        if not bucket:
+            return None, None
+        src_hash = sha256(src)
+        for entry in bucket:
+            if self._hash(entry) == src_hash:
+                return entry[0], src_hash
+        return None, src_hash
+
+    def register(self, path: Path, size: int, content_hash: str | None = None) -> None:
+        """Record a freshly placed file so later files dedupe against it too.
+
+        ``path`` must exist by the time any later same-size comparison forces its
+        hash — pass the copy/move target, or the source path in a dry run.
+        """
+        self._by_size.setdefault(size, []).append([path, content_hash])
+
+
+def unique_destination(src: Path, dest_dir: Path) -> Path:
+    """Return a non-clobbering path for ``src`` inside ``dest_dir``.
+
+    Content-level deduplication is handled up front by :class:`DedupIndex`, so a
+    name collision here is always a *different* file — we just append a numeric
+    suffix (``photo_1.jpg``, ``photo_2.jpg``, …) until the name is free. Nothing
+    is ever overwritten.
     """
     target = dest_dir / src.name
     if not target.exists():
-        return target, False
-
-    src_hash = sha256(src)
+        return target
     stem, suffix = src.stem, src.suffix
     counter = 1
     while target.exists():
-        if target.is_file() and sha256(target) == src_hash:
-            return None, True  # exact duplicate already present
         target = dest_dir / f"{stem}_{counter}{suffix}"
         counter += 1
-    return target, False
+    return target
 
 
 def iter_media(source: Path):
@@ -551,6 +606,20 @@ def main() -> int:
     if total == 0:
         return 0
 
+    # Index what's already under dest so byte-identical files are never copied
+    # again — across every year folder, not just on a name clash. Sizes are read
+    # now; hashing is deferred until two files actually share a size.
+    print(f"{status('INFO')} Indexing existing media under {dest_root}", flush=True)
+    index = DedupIndex()
+    indexed = 0
+    if dest_root.is_dir():
+        for path in dest_root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS:
+                index.add_existing(path)
+                indexed += 1
+    print(f"{status('OK')} Indexed {indexed} existing media file"
+          f"{'s' if indexed != 1 else ''}")
+
     # Live dashboard by default on a TTY; fall back to per-line output when
     # --verbose is set or stderr is not a terminal (e.g. piped to a file).
     live = not args.verbose and sys.stderr.isatty()
@@ -562,6 +631,17 @@ def main() -> int:
     for item in media:
         scanned += 1
         try:
+            size = item.stat().st_size
+            dup_path, content_hash = index.find_duplicate(item, size)
+            if dup_path is not None:
+                skipped_dup += 1
+                if live:
+                    dash.log(f"⚠ {item.name}  (dup of {dup_path.name})", "33")
+                elif args.verbose:
+                    print(f"{status('SKIP')} Duplicate: {item.name}  "
+                          f"(identical to {dup_path.parent.name}/{dup_path.name})")
+                continue
+
             captured, source_kind = get_capture_date(item)
             year = str(captured.year)
             dest_dir = dest_root / year
@@ -569,16 +649,7 @@ def main() -> int:
             if not args.dry_run:
                 dest_dir.mkdir(parents=True, exist_ok=True)
 
-            target, is_dup = unique_destination(item, dest_dir)
-
-            if is_dup:
-                skipped_dup += 1
-                if live:
-                    dash.log(f"⚠ {item.name}  (duplicate)", "33")
-                elif args.verbose:
-                    print(f"{status('SKIP')} Duplicate: {item.name}  (already in {year}/)")
-                continue
-
+            target = unique_destination(item, dest_dir)
             renamed = target.name != item.name
             if args.verbose:
                 action = "MOVE" if args.move else "COPY"
@@ -593,6 +664,10 @@ def main() -> int:
                     shutil.move(str(item), str(target))
                 else:
                     shutil.copy2(str(item), str(target))
+
+            # Register the placed file (its source in a dry run, where target
+            # isn't written) so later identical files are caught this run too.
+            index.register(item if args.dry_run else target, size, content_hash)
 
             moved += 1
             per_year[year] += 1
