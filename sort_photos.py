@@ -27,6 +27,7 @@ Usage:
     python3 sort_photos.py --source ~/Pictures/Inbox --move     # move instead
     python3 sort_photos.py --source /mnt/usb --dest ~/Nostalgia # custom dest
     python3 sort_photos.py --source /media/sdcard --dry-run     # preview only
+    python3 sort_photos.py --source /mnt/phone/DCIM             # mounted Android MTP
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -441,8 +443,10 @@ def unique_destination(src: Path, dest_dir: Path) -> Path:
     return target
 
 
-def iter_media(source: Path):
+def iter_media(source: Path, exclude: Path | None = None):
     for path in sorted(source.rglob("*")):
+        if exclude is not None and path.is_relative_to(exclude):
+            continue
         if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS:
             yield path
 
@@ -564,12 +568,58 @@ class Dashboard:
         self._drawn = False
 
 
+def validate_source_path(source_raw: str) -> Path:
+    """Validate and resolve the source folder path.
+
+    Detects when the provided path is not a normal filesystem path (such as
+    MTP URIs from file managers) and exits with guidance on mounting the phone first.
+    """
+    raw = source_raw.strip()
+    raw_lower = raw.lower()
+
+    if (
+        raw_lower.startswith(("mtp:", "mtp:/", "mtp://", "gphoto2:", "gphoto2://", "ptp:", "camera:"))
+        or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", raw)
+    ):
+        sys.exit(
+            f"Error: '{source_raw}' is not a normal filesystem path.\n\n"
+            "MTP phone storage cannot be accessed directly via MTP URIs.\n"
+            "The device storage must first be mounted or exposed as a local filesystem directory.\n\n"
+            "Example workflow using a mounted path (/mnt/phone/DCIM):\n"
+            "  1. Unlock your phone and select 'File Transfer / MTP' under USB options.\n"
+            "  2. Mount the phone using jmtpfs (or check your file manager's GVFS mount under /run/user/$UID/gvfs/):\n"
+            "       sudo mkdir -p /mnt/phone\n"
+            "       sudo chown $USER:$USER /mnt/phone\n"
+            "       jmtpfs /mnt/phone\n"
+            "  3. Run the sorter against the mounted path:\n"
+            "       python3 sort_photos.py --source /mnt/phone/DCIM\n"
+            "  4. Safely unmount when finished:\n"
+            "       fusermount -u /mnt/phone"
+        )
+
+    resolved = Path(raw).expanduser().resolve()
+    if not resolved.is_dir():
+        if not resolved.exists():
+            if any(term in str(resolved).lower() for term in ("phone", "mtp", "android")):
+                sys.exit(
+                    f"Source folder not found: {resolved}\n\n"
+                    "If you are organizing from an Android phone connected via USB/MTP,\n"
+                    "ensure the device is unlocked and mounted as a filesystem path first\n"
+                    "(e.g. jmtpfs /mnt/phone, then pass --source /mnt/phone/DCIM)."
+                )
+            sys.exit(f"Source folder not found: {resolved}")
+        sys.exit(f"Source path is not a directory: {resolved}")
+
+    return resolved
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source", required=True,
-                        help="Folder to scan recursively (e.g. a phone DCIM, "
-                             "SD/DSLR card mount, external drive, or any folder)")
+                        help="Folder to scan recursively (e.g. a mounted phone DCIM "
+                             "like /mnt/phone/DCIM, SD/DSLR card mount, external drive, "
+                             "or any folder)")
     parser.add_argument("--dest", default="Nostalgia",
                         help="Destination root for YYYY folders (default: Nostalgia)")
     parser.add_argument("--move", action="store_true",
@@ -580,14 +630,11 @@ def main() -> int:
                         help="Print a line per file instead of the live progress bar")
     args = parser.parse_args()
 
+    source = validate_source_path(args.source)
+    dest_root = Path(args.dest).expanduser().resolve()
+
     print(BANNER)
     boot_sequence()
-
-    source = Path(args.source)
-    dest_root = Path(args.dest)
-
-    if not source.is_dir():
-        sys.exit(f"Source folder not found: {source}")
 
     scanned = moved = skipped_dup = errors = 0
     exif_count = video_count = mtime_count = 0
@@ -596,7 +643,7 @@ def main() -> int:
     # Collect up front so we know the total and can show a percentage.
     op_start = time.monotonic()
     print(f"{status('INFO')} Scanning {source}", flush=True)
-    media = list(iter_media(source))
+    media = list(iter_media(source, dest_root))
     total = len(media)
     n_img = sum(1 for p in media if p.suffix.lower() in IMAGE_EXTENSIONS)
     n_vid = total - n_img

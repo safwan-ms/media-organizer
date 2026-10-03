@@ -70,6 +70,40 @@ python sort_photos.py --source "path/to/source_folder" --move
 python sort_photos.py --source "path/to/source" --dest "path/to/destination"
 ```
 
+### 5. Organizing from an Android Phone (USB / MTP on Linux)
+
+Android devices connect to Linux via **MTP** (Media Transfer Protocol) rather than standard USB mass storage. Storage addresses viewed in file managers (such as `mtp://[usb:001,002]/...`) are protocol URIs, not normal filesystem paths.
+
+The script requires a normal filesystem path. To sort photos directly from your phone, first mount or expose the phone storage on your filesystem:
+
+#### Workflow Using `jmtpfs` (Recommended):
+1. **Connect & unlock your phone**: Plug in USB and set USB mode to **File Transfer / MTP**.
+2. **Mount phone to a directory** (e.g. `/mnt/phone`):
+   ```bash
+   sudo mkdir -p /mnt/phone
+   sudo chown $USER:$USER /mnt/phone
+   jmtpfs /mnt/phone
+   ```
+3. **Run the sorter against the mounted path** (e.g. `/mnt/phone/DCIM`):
+   ```bash
+   python sort_photos.py --source /mnt/phone/DCIM --dest ~/Nostalgia
+   ```
+4. **Unmount when finished**:
+   ```bash
+   fusermount -u /mnt/phone
+   ```
+
+#### Alternative: Using Your Desktop File Manager (GVFS):
+If your desktop environment (GNOME, XFCE, etc.) automatically mounts your phone when opened in the file manager, the storage is exposed under GVFS:
+```bash
+# Locate your device mount:
+ls "/run/user/$UID/gvfs/"
+
+# Run the sorter with the GVFS path:
+python sort_photos.py --source "/run/user/$UID/gvfs/mtp:host=.../Internal shared storage/DCIM"
+```
+
+
 ---
 
 ## ⚙️ Command-Line Options
