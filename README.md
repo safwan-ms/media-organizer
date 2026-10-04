@@ -41,6 +41,10 @@ A robust Python script to automatically sort, organize, and deduplicate your pho
    - **Windows**: `winget install Gyan.FFmpeg`
    - **macOS**: `brew install ffmpeg`
    - **Linux**: `sudo apt install ffmpeg`
+4. **pywin32** (Optional, required on Windows only when accessing Android/MTP devices directly):
+   ```bash
+   pip install pywin32
+   ```
 
 ---
 
@@ -102,6 +106,33 @@ ls "/run/user/$UID/gvfs/"
 # Run the sorter with the GVFS path:
 python sort_photos.py --source "/run/user/$UID/gvfs/mtp:host=.../Internal shared storage/DCIM"
 ```
+
+### 6. Windows: Local Folders, Network Shares, and Android MTP
+
+The script natively supports Windows paths, UNC network shares, and Android MTP devices:
+
+#### Local Folders & UNC Paths:
+```powershell
+# Local drive path
+python sort_photos.py --source "C:\Users\User\Pictures" --dest "D:\Photos\Nostalgia"
+
+# UNC network share
+python sort_photos.py --source "\\server\share\Pictures" --dest "C:\Nostalgia"
+```
+
+#### Android Phone (USB / MTP on Windows):
+On Windows, Android phones connected via USB appear under **This PC** in Windows Explorer without a drive letter.
+
+You can organize media directly from the phone using its Explorer namespace without manually copying files first:
+```powershell
+# Run using the Windows Explorer path:
+python sort_photos.py --source "This PC\Pixel 7\Internal shared storage\DCIM" --dest "C:\Users\User\Nostalgia"
+
+# Or by device name:
+python sort_photos.py --source "Pixel 7\Internal shared storage\DCIM"
+```
+*(Requires `pywin32`: install via `pip install pywin32`)*
+
 
 
 ---

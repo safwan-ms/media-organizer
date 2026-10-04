@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sort photos and videos from a source folder into Nostalgia/YYYY by date.
+r"""Sort photos and videos from a source folder into Nostalgia/YYYY by date.
 
 For each photo or video found recursively under the source folder, the capture
 year is determined from embedded metadata, falling back to the file's
@@ -23,11 +23,24 @@ move them instead.
 an SD or DSLR memory card, an external drive, or an existing folder on disk.
 
 Usage:
-    python3 sort_photos.py --source /media/sdcard/DCIM          # copy -> Nostalgia
-    python3 sort_photos.py --source ~/Pictures/Inbox --move     # move instead
-    python3 sort_photos.py --source /mnt/usb --dest ~/Nostalgia # custom dest
-    python3 sort_photos.py --source /media/sdcard --dry-run     # preview only
-    python3 sort_photos.py --source /mnt/phone/DCIM             # mounted Android MTP
+
+    # Linux (local folder, SD card, external drive):
+    python3 sort_photos.py --source /home/user/Pictures
+    python3 sort_photos.py --source /media/sdcard/DCIM --dest ~/Nostalgia
+    python3 sort_photos.py --source ~/Pictures/Inbox --move
+    python3 sort_photos.py --source /home/user/Pictures --dry-run
+
+    # Linux (Android phone mounted via MTP, e.g. jmtpfs or GVFS):
+    python3 sort_photos.py --source /mnt/phone/DCIM
+
+    # Windows (local folder, external drive, or UNC network share):
+    python sort_photos.py --source "C:\Users\User\Pictures"
+    python sort_photos.py --source "D:\DCIM" --dest "D:\Organized"
+    python sort_photos.py --source "\\server\share\Pictures"
+
+    # Windows (Android phone via Windows Explorer MTP namespace):
+    python sort_photos.py --source "This PC\Pixel 7\Internal shared storage\DCIM"
+    python sort_photos.py --source "Pixel 7\Internal shared storage\DCIM"
 """
 
 from __future__ import annotations
@@ -40,10 +53,21 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Iterator
+
+if sys.platform == "win32":
+    try:
+        import win32com.client  # type: ignore
+        HAS_WIN32COM = True
+    except ImportError:
+        HAS_WIN32COM = False
+else:
+    HAS_WIN32COM = False
 
 try:
     from PIL import Image, ExifTags
@@ -344,7 +368,7 @@ def get_video_date(path: Path) -> datetime | None:
     return _mvhd_creation_date(path)
 
 
-def get_capture_date(path: Path) -> tuple[datetime, str]:
+def get_capture_date(path: Path | Any) -> tuple[datetime, str]:
     """Return (capture datetime, source) where source is 'exif', 'video' or 'mtime'.
 
     Photos use EXIF; videos use container metadata (ffprobe, then a built-in
@@ -361,12 +385,17 @@ def get_capture_date(path: Path) -> tuple[datetime, str]:
     return datetime.fromtimestamp(path.stat().st_mtime), "mtime"
 
 
-def sha256(path: Path, chunk_size: int = 1 << 20) -> str:
+def sha256(path: Path | Any, chunk_size: int = 1 << 20) -> str:
+    if hasattr(path, "content_hash") and path.content_hash is not None:
+        return path.content_hash
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(chunk_size), b""):
             h.update(chunk)
-    return h.hexdigest()
+    digest = h.hexdigest()
+    if hasattr(path, "content_hash"):
+        path.content_hash = digest
+    return digest
 
 
 class DedupIndex:
@@ -398,7 +427,7 @@ class DedupIndex:
             return
         self._by_size.setdefault(size, []).append([path, None])
 
-    def find_duplicate(self, src: Path, size: int) -> tuple[Path | None, str | None]:
+    def find_duplicate(self, src: Path | Any, size: int) -> tuple[Path | None, str | None]:
         """Look for a byte-identical file already indexed.
 
         Returns (match, src_hash): ``match`` is the existing path when ``src`` is
@@ -415,7 +444,7 @@ class DedupIndex:
                 return entry[0], src_hash
         return None, src_hash
 
-    def register(self, path: Path, size: int, content_hash: str | None = None) -> None:
+    def register(self, path: Path | Any, size: int, content_hash: str | None = None) -> None:
         """Record a freshly placed file so later files dedupe against it too.
 
         ``path`` must exist by the time any later same-size comparison forces its
@@ -424,7 +453,7 @@ class DedupIndex:
         self._by_size.setdefault(size, []).append([path, content_hash])
 
 
-def unique_destination(src: Path, dest_dir: Path) -> Path:
+def unique_destination(src: Path | Any, dest_dir: Path) -> Path:
     """Return a non-clobbering path for ``src`` inside ``dest_dir``.
 
     Content-level deduplication is handled up front by :class:`DedupIndex`, so a
@@ -443,12 +472,15 @@ def unique_destination(src: Path, dest_dir: Path) -> Path:
     return target
 
 
-def iter_media(source: Path, exclude: Path | None = None):
-    for path in sorted(source.rglob("*")):
-        if exclude is not None and path.is_relative_to(exclude):
-            continue
-        if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS:
-            yield path
+def iter_media(source: Path | Any, exclude: Path | None = None) -> Iterator[Any]:
+    if hasattr(source, "iter_media"):
+        yield from source.iter_media(exclude=exclude)
+    else:
+        for path in sorted(source.rglob("*")):
+            if exclude is not None and path.is_relative_to(exclude):
+                continue
+            if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS:
+                yield path
 
 
 def block_bar(frac: float, width: int = 30) -> str:
@@ -568,58 +600,363 @@ class Dashboard:
         self._drawn = False
 
 
-def validate_source_path(source_raw: str) -> Path:
-    """Validate and resolve the source folder path.
+class MTPFileItem(os.PathLike):
+    """Path-like abstraction representing a media file on an MTP device."""
 
-    Detects when the provided path is not a normal filesystem path (such as
-    MTP URIs from file managers) and exits with guidance on mounting the phone first.
-    """
-    raw = source_raw.strip()
-    raw_lower = raw.lower()
+    def __init__(self, shell: Any, folder_item: Any, staging_dir: Path):
+        self._shell = shell
+        self._item = folder_item
+        self._staging_dir = staging_dir
+        self.name: str = str(folder_item.Name)
+        p = Path(self.name)
+        self.stem: str = p.stem
+        self.suffix: str = p.suffix
+        self.content_hash: str | None = None
+        self._local_path: Path | None = None
 
-    if (
-        raw_lower.startswith(("mtp:", "mtp:/", "mtp://", "gphoto2:", "gphoto2://", "ptp:", "camera:"))
-        or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", raw)
-    ):
+        # Size in bytes
+        try:
+            self._size: int = int(folder_item.Size)
+        except Exception:
+            self._size = 0
+
+        # Modification time timestamp
+        try:
+            mdate = folder_item.ModifyDate
+            if hasattr(mdate, "timestamp"):
+                self._mtime: float = float(mdate.timestamp())
+            elif isinstance(mdate, (int, float)):
+                self._mtime = float(mdate)
+            else:
+                self._mtime = datetime.now().timestamp()
+        except Exception:
+            self._mtime = datetime.now().timestamp()
+
+    def stat(self):
+        class _Stat:
+            def __init__(self, size: int, mtime: float):
+                self.st_size = size
+                self.st_mtime = mtime
+        return _Stat(self._size, self._mtime)
+
+    def is_file(self) -> bool:
+        return True
+
+    def is_relative_to(self, other: Any) -> bool:
+        return False
+
+    def ensure_local(self) -> Path:
+        """Download/stage the file from MTP into staging_dir on demand."""
+        if self._local_path is not None and self._local_path.exists():
+            return self._local_path
+
+        target_file = self._staging_dir / self.name
+        if target_file.exists():
+            try:
+                target_file.unlink()
+            except OSError:
+                pass
+
+        try:
+            dest_ns = self._shell.NameSpace(str(self._staging_dir.resolve()))
+            if dest_ns is None:
+                raise OSError(f"Cannot access staging folder: {self._staging_dir}")
+            # 4: do not show progress dialog, 16: Yes to all, 512: no new dir confirm, 1024: no error UI
+            dest_ns.CopyHere(self._item, 4 | 16 | 512 | 1024)
+        except Exception as e:
+            raise OSError(f"MTP device copy failed (device may have disconnected): {e}")
+
+        # Poll for completion
+        start_time = time.monotonic()
+        timeout = 180.0
+        last_size = -1
+        stable_count = 0
+
+        while time.monotonic() - start_time < timeout:
+            if target_file.exists():
+                try:
+                    curr_size = target_file.stat().st_size
+                    if self._size > 0 and curr_size >= self._size:
+                        self._local_path = target_file
+                        return target_file
+                    if curr_size == last_size and curr_size > 0:
+                        stable_count += 1
+                        if stable_count >= 3:
+                            self._local_path = target_file
+                            return target_file
+                    else:
+                        stable_count = 0
+                        last_size = curr_size
+                except OSError:
+                    pass
+            time.sleep(0.1)
+
+        if not target_file.exists():
+            raise TimeoutError(f"Transfer timed out copying '{self.name}' from MTP device.")
+
+        self._local_path = target_file
+        return target_file
+
+    def __fspath__(self) -> str:
+        return str(self.ensure_local())
+
+    def __str__(self) -> str:
+        return str(self.ensure_local())
+
+    def cleanup(self) -> None:
+        """Clean up the locally staged temporary file to free disk space."""
+        if self._local_path is not None and self._local_path.exists():
+            try:
+                self._local_path.unlink()
+            except OSError:
+                pass
+            self._local_path = None
+
+
+class WindowsMTPSource:
+    """Media source wrapping a Windows Portable Device / MTP folder."""
+
+    def __init__(self, shell: Any, folder: Any, display_name: str):
+        self._shell = shell
+        self._folder = folder
+        self.display_name = display_name
+        self._staging_dir_obj = tempfile.TemporaryDirectory(prefix="media_sorter_mtp_")
+        self.staging_dir = Path(self._staging_dir_obj.name)
+
+    def iter_media(self, exclude: Path | None = None) -> Iterator[MTPFileItem]:
+        stack = [self._folder]
+        while stack:
+            curr = stack.pop()
+            try:
+                items = curr.Items()
+            except Exception as e:
+                raise OSError(f"Failed to read folder on MTP device (device may have disconnected): {e}")
+
+            for item in items:
+                try:
+                    if item.IsFolder:
+                        stack.append(item.GetFolder)
+                    else:
+                        name = item.Name
+                        suffix = Path(name).suffix.lower()
+                        if suffix in MEDIA_EXTENSIONS:
+                            yield MTPFileItem(self._shell, item, self.staging_dir)
+                except Exception as e:
+                    raise OSError(f"Error reading item from MTP device (device may have disconnected): {e}")
+
+    def __str__(self) -> str:
+        return f"This PC\\{self.display_name}"
+
+
+def is_explicit_mtp_or_uri(raw: str) -> bool:
+    """Check if the source string explicitly specifies an MTP or URI scheme."""
+    s = raw.strip()
+    s_lower = s.lower()
+    if s_lower.startswith(("mtp:", "mtp:/", "mtp://", "mtp:\\", "gphoto2:", "gphoto2://", "ptp:", "camera:")):
+        return True
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", s):
+        return True
+    if s_lower.startswith(("this pc\\", "this pc/", "computer\\", "computer/", "my computer\\", "my computer/")):
+        return True
+    return False
+
+
+def parse_windows_mtp_path(raw: str) -> list[str]:
+    """Parse and normalize a Windows Explorer MTP path into parts."""
+    s = raw.strip()
+    for prefix in ("mtp://", "mtp:\\", "mtp:/", "mtp:"):
+        if s.lower().startswith(prefix):
+            s = s[len(prefix):]
+            break
+    s = s.replace("/", "\\")
+    parts = [p.strip() for p in s.split("\\") if p.strip()]
+    if parts and parts[0].lower() in ("this pc", "computer", "my computer"):
+        parts = parts[1:]
+    return parts
+
+
+def resolve_windows_mtp_source(raw_source: str) -> WindowsMTPSource:
+    """Resolve an Android/MTP source under 'This PC' in Windows Explorer."""
+    if not HAS_WIN32COM:
         sys.exit(
-            f"Error: '{source_raw}' is not a normal filesystem path.\n\n"
-            "MTP phone storage cannot be accessed directly via MTP URIs.\n"
-            "The device storage must first be mounted or exposed as a local filesystem directory.\n\n"
-            "Example workflow using a mounted path (/mnt/phone/DCIM):\n"
-            "  1. Unlock your phone and select 'File Transfer / MTP' under USB options.\n"
-            "  2. Mount the phone using jmtpfs (or check your file manager's GVFS mount under /run/user/$UID/gvfs/):\n"
-            "       sudo mkdir -p /mnt/phone\n"
-            "       sudo chown $USER:$USER /mnt/phone\n"
-            "       jmtpfs /mnt/phone\n"
-            "  3. Run the sorter against the mounted path:\n"
-            "       python3 sort_photos.py --source /mnt/phone/DCIM\n"
-            "  4. Safely unmount when finished:\n"
-            "       fusermount -u /mnt/phone"
+            "Error: pywin32 is required to access Android/MTP devices directly on Windows.\n"
+            "Please install it using: pip install pywin32"
         )
 
-    resolved = Path(raw).expanduser().resolve()
-    if not resolved.is_dir():
-        if not resolved.exists():
-            if any(term in str(resolved).lower() for term in ("phone", "mtp", "android")):
-                sys.exit(
-                    f"Source folder not found: {resolved}\n\n"
-                    "If you are organizing from an Android phone connected via USB/MTP,\n"
-                    "ensure the device is unlocked and mounted as a filesystem path first\n"
-                    "(e.g. jmtpfs /mnt/phone, then pass --source /mnt/phone/DCIM)."
-                )
-            sys.exit(f"Source folder not found: {resolved}")
-        sys.exit(f"Source path is not a directory: {resolved}")
+    parts = parse_windows_mtp_path(raw_source)
+    if not parts:
+        sys.exit(f"Error: Invalid MTP source path: '{raw_source}'")
 
-    return resolved
+    device_name = parts[0]
+    subpath = parts[1:]
+
+    try:
+        shell = win32com.client.Dispatch("Shell.Application")
+        this_pc = shell.NameSpace(17)  # ssfDRIVES = 17 (This PC / Computer)
+        if this_pc is None:
+            sys.exit("Error: Failed to access Windows Shell 'This PC' namespace.")
+    except Exception as e:
+        sys.exit(f"Error initializing Windows Shell COM: {e}")
+
+    # Enumerate devices in This PC
+    device_item = None
+    available_devices: list[str] = []
+    try:
+        for item in this_pc.Items():
+            name = str(item.Name)
+            available_devices.append(name)
+            if name.lower() == device_name.lower():
+                device_item = item
+                break
+    except Exception as e:
+        sys.exit(f"Error accessing devices in 'This PC' (device may have disconnected): {e}")
+
+    if device_item is None:
+        portable_candidates = [d for d in available_devices if not (len(d) >= 3 and d[-2:] == ":)")]
+        dev_list = ", ".join(f"'{d}'" for d in portable_candidates)
+        hint = f"\nAvailable portable devices in 'This PC': {dev_list}" if dev_list else "\nNo portable/MTP devices detected in 'This PC'."
+        sys.exit(
+            f"Error: Unsupported or disconnected MTP device '{device_name}'.{hint}\n"
+            "Ensure the Android device is connected via USB, unlocked, and 'File Transfer / MTP' mode is enabled."
+        )
+
+    try:
+        current_folder = device_item.GetFolder
+        if current_folder is None:
+            sys.exit(
+                f"Error: Permission denied or device locked: Unable to access storage on '{device_name}'.\n"
+                "Please unlock your phone screen and allow USB file transfer access."
+            )
+    except Exception as e:
+        sys.exit(f"Error accessing MTP device '{device_name}': {e}. Device may have been disconnected.")
+
+    # Navigate subpath
+    navigated = [device_item.Name]
+    for part in subpath:
+        found_child = None
+        available_children: list[str] = []
+        try:
+            for child in current_folder.Items():
+                if child.IsFolder:
+                    available_children.append(str(child.Name))
+                    if child.Name.lower() == part.lower():
+                        found_child = child
+                        break
+        except Exception as e:
+            sys.exit(f"Error: MTP device disconnected or unresponsive while reading '{'/'.join(navigated)}': {e}")
+
+        if found_child is None:
+            avail_str = ", ".join(f"'{c}'" for c in available_children) or "None"
+            sys.exit(
+                f"Error: Folder '{part}' not found in '{'/'.join(navigated)}'.\n"
+                f"Available folders: {avail_str}"
+            )
+        try:
+            current_folder = found_child.GetFolder
+            navigated.append(found_child.Name)
+        except Exception as e:
+            sys.exit(f"Error opening folder '{found_child.Name}' on MTP device: {e}")
+
+    return WindowsMTPSource(shell, current_folder, "\\".join(navigated))
+
+
+def resolve_source(raw_source: str, dest_root: Path) -> Path | WindowsMTPSource:
+    """Resolve and validate the source into either a filesystem Path or an MTP source."""
+    raw = raw_source.strip()
+    is_windows = sys.platform == "win32"
+    is_linux = sys.platform.startswith("linux")
+    is_darwin = sys.platform == "darwin"
+
+    if not (is_windows or is_linux or is_darwin):
+        sys.exit(f"Error: Unsupported platform '{sys.platform}'. Supported platforms are Linux, Windows, and macOS.")
+
+    # 1. Check if the string explicitly specifies an MTP device / URI
+    if is_explicit_mtp_or_uri(raw):
+        if is_windows:
+            return resolve_windows_mtp_source(raw)
+        else:
+            sys.exit(
+                f"Error: '{raw_source}' is not a normal filesystem path.\n\n"
+                "Android phones connected via USB/MTP cannot be accessed directly via MTP URIs\n"
+                "or file manager addresses on Linux.\n"
+                "The device storage must first be mounted or exposed as a normal filesystem directory.\n\n"
+                "Example workflow using a mounted path (/mnt/phone/DCIM):\n"
+                "  1. Unlock your phone and select 'File Transfer / MTP' under USB options.\n"
+                "  2. Mount the phone to a local directory using jmtpfs (or check your file manager's GVFS mount):\n"
+                "       sudo mkdir -p /mnt/phone\n"
+                "       sudo chown $USER:$USER /mnt/phone\n"
+                "       jmtpfs /mnt/phone\n"
+                "     (Or locate your desktop file manager's GVFS mount under /run/user/$UID/gvfs/)\n"
+                "  3. Run the sorter against the mounted path:\n"
+                "       python3 sort_photos.py --source /mnt/phone/DCIM\n"
+                "  4. Safely unmount when finished:\n"
+                "       fusermount -u /mnt/phone"
+            )
+
+    # 2. Check if it is a local filesystem path
+    fs_path = Path(raw).expanduser().resolve()
+
+    if fs_path.is_dir():
+        # Safety check: source == destination
+        try:
+            if fs_path.samefile(dest_root):
+                sys.exit(f"Error: Source and destination cannot be the same directory ({fs_path}).")
+        except (FileNotFoundError, OSError):
+            if fs_path == dest_root:
+                sys.exit(f"Error: Source and destination cannot be the same directory ({fs_path}).")
+
+        # Permission check
+        try:
+            next(fs_path.iterdir(), None)
+        except PermissionError:
+            sys.exit(f"Error: Permission denied accessing source directory: {fs_path}")
+        except OSError as e:
+            sys.exit(f"Error: Access failure on source directory: {fs_path} ({e})")
+
+        return fs_path
+
+    # If it exists on filesystem but is not a directory
+    if fs_path.exists() and not fs_path.is_dir():
+        sys.exit(f"Error: Source path is not a directory: {fs_path}")
+
+    # 3. Path does not exist on filesystem.
+    # On Windows, could it be an MTP device name without the 'This PC\' prefix?
+    if is_windows:
+        is_drive_or_unc = bool(re.match(r"^[a-zA-Z]:[\\/]", raw)) or raw.startswith(("\\\\", "//"))
+        if not is_drive_or_unc:
+            try:
+                return resolve_windows_mtp_source(raw)
+            except SystemExit:
+                raise
+            except Exception as e:
+                sys.exit(f"Error resolving source as MTP device: {e}")
+
+    # Missing path error reporting
+    if any(k in str(fs_path).lower() for k in ("phone", "mtp", "android")):
+        if is_windows:
+            sys.exit(
+                f"Error: Source folder or portable device not found: '{raw_source}'.\n"
+                "Ensure your phone is connected via USB, unlocked, and 'File Transfer / MTP' mode is enabled."
+            )
+        else:
+            sys.exit(
+                f"Error: Source folder not found: {fs_path}\n\n"
+                "If you are organizing from an Android phone connected via USB/MTP on Linux,\n"
+                "ensure the device is unlocked and mounted as a filesystem path first\n"
+                "(e.g. sudo mkdir -p /mnt/phone && jmtpfs /mnt/phone, then pass --source /mnt/phone/DCIM)."
+            )
+
+    sys.exit(f"Error: Source folder not found: {fs_path}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source", required=True,
-                        help="Folder to scan recursively (e.g. a mounted phone DCIM "
-                             "like /mnt/phone/DCIM, SD/DSLR card mount, external drive, "
-                             "or any folder)")
+                        help="Folder to scan recursively:\n"
+                             "  Linux:   Local folder or mounted phone (e.g. /home/user/Pictures, /mnt/phone/DCIM)\n"
+                             "  Windows: Local folder, UNC path, or MTP device (e.g. 'C:\\Pictures', "
+                             "'This PC\\Phone\\Internal shared storage\\DCIM')")
     parser.add_argument("--dest", default="Nostalgia",
                         help="Destination root for YYYY folders (default: Nostalgia)")
     parser.add_argument("--move", action="store_true",
@@ -630,8 +967,10 @@ def main() -> int:
                         help="Print a line per file instead of the live progress bar")
     args = parser.parse_args()
 
-    source = validate_source_path(args.source)
+    if is_explicit_mtp_or_uri(args.dest):
+        sys.exit("Error: Destination must be a local filesystem directory, not an MTP device.")
     dest_root = Path(args.dest).expanduser().resolve()
+    source = resolve_source(args.source, dest_root)
 
     print(BANNER)
     boot_sequence()
@@ -735,6 +1074,8 @@ def main() -> int:
                 print(f"{status('ERROR', err=True)} Error processing {item.name}: {exc}",
                       file=sys.stderr)
         finally:
+            if hasattr(item, "cleanup"):
+                item.cleanup()
             if live:
                 dash.update(scanned, moved, errors)
 
